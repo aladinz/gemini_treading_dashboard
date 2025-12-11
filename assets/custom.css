@@ -1,0 +1,15 @@
+/* assets/custom.css */
+.rating-buy, .rating-strong-buy, .rating-outperform {
+    color: green;
+    font-weight: bold;
+}
+.rating-sell, .rating-strong-sell, .rating-underperform {
+    color: red;
+    font-weight: bold;
+}
+.rating-hold, .rating-neutral, .rating-perform {
+    color: orange;
+}
+.rating-na {
+    color: #777;
+}
