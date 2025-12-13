@@ -262,6 +262,40 @@ layout = dbc.Container([
             ], style={'border': '1px solid #495057'})
         ], md=12, lg=3),
         dbc.Col([
+            dbc.Card([
+                dbc.CardHeader(html.H5("🎯 Position Size Calculator", className="mb-0", style={'color': '#ffffff'}), 
+                             style={'backgroundColor': '#212529'}),
+                dbc.CardBody([
+                    dbc.Row([
+                        dbc.Col([
+                            dbc.Label("Account Size ($):", style={'fontWeight': 'bold', 'color': '#e0e0e0', 'fontSize': '0.9rem'}),
+                            dbc.Input(id="account-size", type="number", value=10000, min=100, step=100,
+                                    style={'backgroundColor': '#2d2d2d', 'color': '#ffffff', 'border': '1px solid #495057'}),
+                        ], md=6),
+                        dbc.Col([
+                            dbc.Label("Risk per Trade (%):", style={'fontWeight': 'bold', 'color': '#e0e0e0', 'fontSize': '0.9rem'}),
+                            dbc.Input(id="risk-percent", type="number", value=2, min=0.1, max=10, step=0.1,
+                                    style={'backgroundColor': '#2d2d2d', 'color': '#ffffff', 'border': '1px solid #495057'}),
+                        ], md=6),
+                    ]),
+                    dbc.Row([
+                        dbc.Col([
+                            dbc.Label("Entry Price ($):", className="mt-2", style={'fontWeight': 'bold', 'color': '#e0e0e0', 'fontSize': '0.9rem'}),
+                            dbc.Input(id="entry-price", type="number", value=0, min=0, step=0.01,
+                                    style={'backgroundColor': '#2d2d2d', 'color': '#ffffff', 'border': '1px solid #495057'}),
+                        ], md=6),
+                        dbc.Col([
+                            dbc.Label("Stop Loss ($):", className="mt-2", style={'fontWeight': 'bold', 'color': '#e0e0e0', 'fontSize': '0.9rem'}),
+                            dbc.Input(id="stop-loss-price", type="number", value=0, min=0, step=0.01,
+                                    style={'backgroundColor': '#2d2d2d', 'color': '#ffffff', 'border': '1px solid #495057'}),
+                        ], md=6),
+                    ]),
+                    html.Hr(style={'borderColor': '#495057', 'margin': '15px 0'}),
+                    html.Div(id="position-size-output", style={'fontSize': '0.95rem'})
+                ], style={'backgroundColor': '#2d2d2d', 'padding': '15px'})
+            ], style={'border': '1px solid #495057', 'marginBottom': '20px'})
+        ], md=12, lg=5),
+        dbc.Col([
             html.Div(id="signal-card", children=[
                 dbc.Card([
                     dbc.CardHeader(html.H6("💡 Trading Signal", className="mb-0", style={'color': '#ffffff'}),
@@ -271,7 +305,7 @@ layout = dbc.Container([
                     ], style={'backgroundColor': '#2d2d2d'})
                 ], style={'border': '1px solid #495057'})
             ])
-        ], md=12, lg=9)
+        ], md=12, lg=4)
     ], className="mb-4"),
     dbc.Row([
         dbc.Col(dcc.Loading(children=[dcc.Graph(id="stock-chart")], type="default"), width=12)
@@ -284,7 +318,9 @@ layout = dbc.Container([
 @callback(
     [Output("stock-chart", "figure"),
      Output("analysis-output", "children"),
-     Output("signal-card", "children")],
+     Output("signal-card", "children"),
+     Output("entry-price", "value"),
+     Output("stop-loss-price", "value")],
     Input("analyze-btn", "n_clicks"),
     [State("stock-input", "value"),
      State("timeframe-dropdown", "value")],
@@ -294,7 +330,7 @@ def update_chart(n_clicks, symbol, timeframe):
     if not n_clicks or not symbol:
         return go.Figure(), "", dbc.Card([
             dbc.CardBody(html.H5("Enter a symbol and click Analyze"))
-        ])
+        ]), 0, 0
     
     interval = {'1d_intraday': '5m', '5d': '15m', '1mo': '1h', '3mo': '1d'}.get(timeframe, '1d')
     df, company_name, error = fetch_stock_data(symbol, timeframe, interval)
@@ -302,7 +338,7 @@ def update_chart(n_clicks, symbol, timeframe):
     if error:
         return go.Figure(), dbc.Alert(error, color="danger"), dbc.Card([
             dbc.CardBody(html.H5("Error loading data", className="text-danger"))
-        ])
+        ]), 0, 0
     
     # Calculate all indicators
     df = calculate_moving_averages(df)
@@ -613,4 +649,88 @@ def update_chart(n_clicks, symbol, timeframe):
         ], style={'backgroundColor': '#2d2d2d'})
     ], className="mt-3", style={'border': '1px solid #495057'})
     
-    return fig, analysis, signal_card
+    # Return current price as entry and calculated stop loss
+    entry = round(price, 2) if price else 0
+    stop = round(stop_loss, 2) if stop_loss else 0
+    
+    return fig, analysis, signal_card, entry, stop
+
+
+@callback(
+    Output("position-size-output", "children"),
+    [Input("account-size", "value"),
+     Input("risk-percent", "value"),
+     Input("entry-price", "value"),
+     Input("stop-loss-price", "value")]
+)
+def calculate_position_size(account_size, risk_percent, entry_price, stop_loss):
+    """Calculate position size based on risk management parameters"""
+    
+    if not all([account_size, risk_percent, entry_price, stop_loss]) or entry_price <= 0 or stop_loss <= 0:
+        return html.Div([
+            html.P("⚠️ Enter all values to calculate position size", 
+                   style={'color': '#FFA726', 'textAlign': 'center', 'marginBottom': '0'})
+        ])
+    
+    # Validate that stop loss is below entry for long positions
+    if stop_loss >= entry_price:
+        return html.Div([
+            html.P("⚠️ Stop loss must be below entry price for long positions", 
+                   style={'color': '#ef5350', 'textAlign': 'center', 'marginBottom': '0'})
+        ])
+    
+    # Calculate risk amount in dollars
+    risk_amount = account_size * (risk_percent / 100)
+    
+    # Calculate risk per share
+    risk_per_share = entry_price - stop_loss
+    
+    # Calculate number of shares
+    shares = int(risk_amount / risk_per_share)
+    
+    # Calculate position value
+    position_value = shares * entry_price
+    
+    # Calculate position as percentage of account
+    position_percent = (position_value / account_size) * 100
+    
+    # Determine if position is too large (more than 25% of account)
+    alert_color = '#ef5350' if position_percent > 25 else '#26a69a'
+    
+    return html.Div([
+        dbc.Row([
+            dbc.Col([
+                html.Div([
+                    html.Small("SHARES TO BUY", style={'color': '#adb5bd', 'fontSize': '0.75rem'}),
+                    html.H4(f"{shares:,}", style={'color': '#26a69a', 'fontWeight': 'bold', 'marginBottom': '0'})
+                ], style={'textAlign': 'center'})
+            ], width=4),
+            dbc.Col([
+                html.Div([
+                    html.Small("POSITION VALUE", style={'color': '#adb5bd', 'fontSize': '0.75rem'}),
+                    html.H4(f"${position_value:,.2f}", style={'color': alert_color, 'fontWeight': 'bold', 'marginBottom': '0'})
+                ], style={'textAlign': 'center'})
+            ], width=4),
+            dbc.Col([
+                html.Div([
+                    html.Small("RISK AMOUNT", style={'color': '#adb5bd', 'fontSize': '0.75rem'}),
+                    html.H4(f"${risk_amount:,.2f}", style={'color': '#FFA726', 'fontWeight': 'bold', 'marginBottom': '0'})
+                ], style={'textAlign': 'center'})
+            ], width=4),
+        ]),
+        html.Hr(style={'borderColor': '#495057', 'margin': '10px 0'}),
+        dbc.Row([
+            dbc.Col([
+                html.Small(f"Risk per Share: ${risk_per_share:.2f}", 
+                          style={'color': '#adb5bd', 'fontSize': '0.85rem'}),
+            ], width=6),
+            dbc.Col([
+                html.Small(f"Position Size: {position_percent:.1f}% of account", 
+                          style={'color': alert_color, 'fontSize': '0.85rem'}),
+            ], width=6),
+        ]),
+        html.Div([
+            html.Small("⚠️ Warning: Position exceeds 25% of account", 
+                      style={'color': '#ef5350', 'fontSize': '0.85rem', 'fontWeight': 'bold'})
+        ], style={'textAlign': 'center', 'marginTop': '5px'}) if position_percent > 25 else html.Div()
+    ])
