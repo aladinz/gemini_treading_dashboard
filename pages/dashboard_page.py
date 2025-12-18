@@ -1,11 +1,13 @@
 import dash
-from dash import dcc, html, Input, Output, State, callback
+from dash import dcc, html, Input, Output, State, callback, no_update
 import dash_bootstrap_components as dbc
 import yfinance as yf
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import pandas as pd
 import numpy as np
+from datetime import datetime
+from utils import add_journal_entry
 
 dash.register_page(__name__, path='/', name='Dashboard')
 
@@ -161,22 +163,27 @@ def generate_swing_signals(df):
         sell_score += 1
         reasons['sell'].append(f"Strong downward momentum ({price_change_5d:.1f}%)")
     
-    # Determine overall signal
+    # Determine overall signal with improved confidence calculation
+    # Max possible score is around 10 (2+3+2+2+1 for each indicator)
     if buy_score > sell_score and buy_score >= 4:
         signal = "STRONG BUY"
-        confidence = min(buy_score * 10, 95)
+        # Strong signals: map 4-10 points to 65-95% confidence
+        confidence = min(50 + (buy_score * 8), 95)
     elif buy_score > sell_score and buy_score >= 2:
         signal = "BUY"
-        confidence = min(buy_score * 10, 85)
+        # Regular signals: map 2-3 points to 45-60% confidence
+        confidence = min(30 + (buy_score * 15), 65)
     elif sell_score > buy_score and sell_score >= 4:
         signal = "STRONG SELL"
-        confidence = min(sell_score * 10, 95)
+        # Strong signals: map 4-10 points to 65-95% confidence
+        confidence = min(50 + (sell_score * 8), 95)
     elif sell_score > buy_score and sell_score >= 2:
         signal = "SELL"
-        confidence = min(sell_score * 10, 85)
+        # Regular signals: map 2-3 points to 45-60% confidence
+        confidence = min(30 + (sell_score * 15), 65)
     else:
         signal = "HOLD"
-        confidence = 50
+        confidence = 40
     
     # Mark signals on chart
     df['Buy_Signal_Price'] = np.nan
@@ -189,19 +196,125 @@ def generate_swing_signals(df):
     
     return df, signal, confidence, reasons
 
+def calculate_suggested_entry(current_price, signal, supports, resistances, rsi=None):
+    """Calculate a suggested entry point based on technical analysis.
+    
+    Priority for BUY signals:
+    1. Check support levels first - suggest nearest support for better entry
+    2. Only if very oversold (RSI < 30) AND at/near support, suggest current price
+    3. Otherwise suggest waiting for pullback
+    
+    Priority for SELL signals:
+    1. Check resistance levels first - suggest nearest resistance for better exit
+    2. Only if very overbought (RSI > 70) AND at/near resistance, suggest current price
+    
+    Returns: (suggested_price, reason_text)
+    """
+    if signal in ["BUY", "STRONG BUY"]:
+        # For BUY signals, prioritize support levels
+        if supports:
+            # Find the nearest support below current price
+            nearest_support = max([s for s in supports if s < current_price], default=None)
+            
+            if nearest_support:
+                # Calculate distance to support
+                distance_to_support = ((current_price - nearest_support) / current_price) * 100
+                
+                # If we're extremely close to support (within 0.5%) AND RSI is oversold
+                if distance_to_support <= 0.5 and rsi and rsi < 30:
+                    return current_price, f"BUY near ${current_price:.2f} (at support ${nearest_support:.2f}, RSI {rsi:.1f})"
+                # If we're close to support (within 2%), suggest the support level
+                elif distance_to_support <= 2.0:
+                    if rsi and rsi < 30:
+                        return nearest_support, f"BUY near ${nearest_support:.2f} (at support, RSI oversold {rsi:.1f})"
+                    else:
+                        return nearest_support, f"BUY near ${nearest_support:.2f} (wait for support level)"
+                # Otherwise suggest waiting for pullback to support
+                else:
+                    if rsi and rsi < 25:
+                        return nearest_support, f"BUY near ${nearest_support:.2f} (oversold, wait for support)"
+                    else:
+                        return nearest_support, f"BUY near ${nearest_support:.2f} (wait for pullback to support)"
+            else:
+                # No support below current price, suggest a pullback target
+                # Even if oversold, better to wait for a small dip
+                suggested = current_price * 0.98
+                if rsi and rsi < 25:
+                    return suggested, f"BUY near ${suggested:.2f} (oversold RSI {rsi:.1f}, wait for 2% dip)"
+                else:
+                    return suggested, f"BUY near ${suggested:.2f} (wait for 2% pullback)"
+        else:
+            # No support levels identified, always suggest a pullback
+            # Never suggest current price even if oversold - better entry discipline
+            suggested = current_price * 0.98
+            if rsi and rsi < 25:
+                return suggested, f"BUY near ${suggested:.2f} (oversold RSI {rsi:.1f}, wait for 2% dip)"
+            elif rsi and rsi < 35:
+                return suggested, f"BUY near ${suggested:.2f} (RSI {rsi:.1f}, wait for minor dip)"
+            else:
+                return suggested, f"BUY near ${suggested:.2f} (wait for 2% pullback)"
+    
+    elif signal in ["SELL", "STRONG SELL"]:
+        # For SELL signals (exiting long positions), determine best exit point
+        # Priority: Exit at current price OR wait for bounce to resistance for better exit
+        
+        if resistances:
+            # Find the nearest resistance above current price
+            nearest_resistance = min([r for r in resistances if r > current_price], default=None)
+            
+            if nearest_resistance:
+                # Calculate distance to resistance
+                distance_to_resistance = ((nearest_resistance - current_price) / current_price) * 100
+                
+                # If very close to resistance (within 1%), exit now
+                if distance_to_resistance <= 1.0:
+                    if rsi and rsi > 70:
+                        return current_price, f"SELL near ${current_price:.2f} (at resistance, RSI {rsi:.1f})"
+                    else:
+                        return current_price, f"SELL near ${current_price:.2f} (at resistance ${nearest_resistance:.2f})"
+                # If resistance is 2-5% above, suggest current price (don't chase)
+                elif distance_to_resistance <= 5.0:
+                    if rsi and rsi > 70:
+                        return current_price, f"SELL near ${current_price:.2f} (exit now, RSI overbought {rsi:.1f})"
+                    else:
+                        return current_price, f"SELL near ${current_price:.2f} (exit position now)"
+                # If resistance is far above (>5%), exit at current or suggest trailing stop
+                else:
+                    return current_price, f"SELL near ${current_price:.2f} (exit position, use trailing stop)"
+            else:
+                # No resistance above - exit now
+                if rsi and rsi > 70:
+                    return current_price, f"SELL near ${current_price:.2f} (exit now, RSI {rsi:.1f})"
+                else:
+                    return current_price, f"SELL near ${current_price:.2f} (exit position)"
+        else:
+            # No resistance levels - exit at current price
+            if rsi and rsi > 70:
+                return current_price, f"SELL near ${current_price:.2f} (exit now, RSI overbought {rsi:.1f})"
+            else:
+                return current_price, f"SELL near ${current_price:.2f} (exit position)"
+    
+    else:  # HOLD
+        return current_price, f"HOLD - No clear entry point at ${current_price:.2f}"
+
 def calculate_risk_management(current_price, signal, supports, resistances):
-    """Calculate stop loss and take profit levels"""
+    """Calculate stop loss and take profit levels for LONG positions only.
+    
+    Note: This dashboard is designed for long-only trading. SELL signals indicate
+    when to exit existing long positions, not to enter short positions.
+    Stop loss is always below entry price.
+    """
     risk_reward_ratio = 2.0  # Target 2:1 reward-to-risk
     
+    # Always calculate stop loss below entry (long position protection)
+    if supports:
+        stop_loss = min(supports[-1], current_price * 0.95)
+    else:
+        stop_loss = current_price * 0.95
+    
+    risk = current_price - stop_loss
+    
     if signal in ["BUY", "STRONG BUY"]:
-        # Stop loss: below nearest support or 5% below entry
-        if supports:
-            stop_loss = min(supports[-1], current_price * 0.95)
-        else:
-            stop_loss = current_price * 0.95
-        
-        risk = current_price - stop_loss
-        
         # Take profit: above nearest resistance or risk*reward ratio
         if resistances:
             take_profit = max(resistances[0], current_price + (risk * risk_reward_ratio))
@@ -209,23 +322,13 @@ def calculate_risk_management(current_price, signal, supports, resistances):
             take_profit = current_price + (risk * risk_reward_ratio)
             
     elif signal in ["SELL", "STRONG SELL"]:
-        # Stop loss: above nearest resistance or 5% above entry
-        if resistances:
-            stop_loss = max(resistances[0], current_price * 1.05)
-        else:
-            stop_loss = current_price * 1.05
-        
-        risk = stop_loss - current_price
-        
-        # Take profit: below nearest support or risk*reward ratio
+        # For SELL signals, show downside target (where price may go)
         if supports:
             take_profit = min(supports[-1], current_price - (risk * risk_reward_ratio))
         else:
             take_profit = current_price - (risk * risk_reward_ratio)
     else:
-        stop_loss = current_price * 0.95
         take_profit = current_price * 1.10
-        risk = current_price - stop_loss
     
     return stop_loss, take_profit, risk
 
@@ -233,13 +336,50 @@ layout = dbc.Container([
     dbc.Row([
         dbc.Col([
             dbc.Card([
-                dbc.CardHeader(html.H5("📊 Stock Analysis Tool", className="mb-0", style={'color': '#ffffff'}), 
-                             style={'backgroundColor': '#212529'}),
+                dbc.CardHeader(
+                    html.Div([
+                        html.H5("📊 Stock Analysis Tool", className="mb-0", 
+                               style={'color': '#ffffff', 'fontWeight': '600', 'letterSpacing': '0.5px'})
+                    ]),
+                    style={
+                        'background': 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)',
+                        'borderBottom': 'none',
+                        'padding': '1rem 1.25rem'
+                    }
+                ),
                 dbc.CardBody([
-                    dbc.Label("Stock Symbol:", style={'fontWeight': 'bold', 'color': '#e0e0e0'}),
-                    dbc.Input(id="stock-input", type="text", value="AAPL", placeholder="Enter ticker symbol",
-                            style={'backgroundColor': '#2d2d2d', 'color': '#ffffff', 'border': '1px solid #495057'}),
-                    dbc.Label("Timeframe:", className="mt-3", style={'fontWeight': 'bold', 'color': '#e0e0e0'}),
+                    dbc.Label("Stock Symbol:", style={
+                        'fontWeight': '600', 
+                        'color': '#e0e0e0',
+                        'fontSize': '0.875rem',
+                        'textTransform': 'uppercase',
+                        'letterSpacing': '0.5px',
+                        'marginBottom': '0.5rem'
+                    }),
+                    dbc.Input(
+                        id="stock-input", 
+                        type="text", 
+                        value="AAPL", 
+                        placeholder="Enter ticker symbol",
+                        style={
+                            'backgroundColor': '#1a1a1a', 
+                            'color': '#ffffff', 
+                            'border': '2px solid #495057',
+                            'borderRadius': '8px',
+                            'padding': '0.75rem',
+                            'fontSize': '1rem',
+                            'fontWeight': '500',
+                            'transition': 'all 0.3s ease'
+                        }
+                    ),
+                    dbc.Label("Timeframe:", className="mt-3", style={
+                        'fontWeight': '600', 
+                        'color': '#e0e0e0',
+                        'fontSize': '0.875rem',
+                        'textTransform': 'uppercase',
+                        'letterSpacing': '0.5px',
+                        'marginBottom': '0.5rem'
+                    }),
                     dcc.Dropdown(
                         id="timeframe-dropdown",
                         options=[
@@ -256,15 +396,46 @@ layout = dbc.Container([
                         clearable=False,
                         style={'color': '#000000'}
                     ),
-                    dbc.Button("🔍 Analyze Stock", id="analyze-btn", color="success", 
-                             className="mt-3 w-100", size="lg")
-                ], style={'backgroundColor': '#2d2d2d'})
-            ], style={'border': '1px solid #495057'})
+                    dbc.Button(
+                        [html.I(className="bi bi-search me-2"), "Analyze Stock"],
+                        id="analyze-btn",
+                        style={
+                            'background': 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)',
+                            'border': 'none',
+                            'borderRadius': '8px',
+                            'padding': '0.75rem 1.5rem',
+                            'fontSize': '1rem',
+                            'fontWeight': '600',
+                            'textTransform': 'uppercase',
+                            'letterSpacing': '0.5px',
+                            'boxShadow': '0 4px 15px rgba(102, 126, 234, 0.4)',
+                            'transition': 'all 0.3s ease'
+                        },
+                        className="mt-3 w-100", 
+                        size="lg"
+                    )
+                ], style={
+                    'backgroundColor': '#2d2d2d',
+                    'padding': '1.5rem'
+                })
+            ], style={
+                'border': 'none',
+                'borderRadius': '12px',
+                'boxShadow': '0 8px 32px rgba(0, 0, 0, 0.4)',
+                'overflow': 'hidden'
+            })
         ], md=12, lg=3),
         dbc.Col([
             dbc.Card([
-                dbc.CardHeader(html.H5("🎯 Position Size Calculator", className="mb-0", style={'color': '#ffffff'}), 
-                             style={'backgroundColor': '#212529'}),
+                dbc.CardHeader(
+                    html.H5("🎯 Position Size Calculator", className="mb-0", 
+                           style={'color': '#ffffff', 'fontWeight': '600', 'letterSpacing': '0.5px'}),
+                    style={
+                        'background': 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)',
+                        'borderBottom': 'none',
+                        'padding': '1rem 1.25rem'
+                    }
+                ),
                 dbc.CardBody([
                     dbc.Row([
                         dbc.Col([
@@ -281,37 +452,217 @@ layout = dbc.Container([
                     dbc.Row([
                         dbc.Col([
                             dbc.Label("Entry Price ($):", className="mt-2", style={'fontWeight': 'bold', 'color': '#e0e0e0', 'fontSize': '0.9rem'}),
-                            dbc.Input(id="entry-price", type="number", value=0, min=0, step=0.01,
+                            dbc.Input(id="entry-price", type="number", placeholder="Enter price", min=0.01, step=0.01,
                                     style={'backgroundColor': '#2d2d2d', 'color': '#ffffff', 'border': '1px solid #495057'}),
                         ], md=6),
                         dbc.Col([
                             dbc.Label("Stop Loss ($):", className="mt-2", style={'fontWeight': 'bold', 'color': '#e0e0e0', 'fontSize': '0.9rem'}),
-                            dbc.Input(id="stop-loss-price", type="number", value=0, min=0, step=0.01,
+                            dbc.Input(id="stop-loss-price", type="number", placeholder="Enter stop loss", min=0.01, step=0.01,
                                     style={'backgroundColor': '#2d2d2d', 'color': '#ffffff', 'border': '1px solid #495057'}),
                         ], md=6),
                     ]),
-                    html.Hr(style={'borderColor': '#495057', 'margin': '15px 0'}),
-                    html.Div(id="position-size-output", style={'fontSize': '0.95rem'})
-                ], style={'backgroundColor': '#2d2d2d', 'padding': '15px'})
-            ], style={'border': '1px solid #495057', 'marginBottom': '20px'})
+                    html.Hr(style={'borderColor': '#495057', 'margin': '15px 0', 'opacity': '0.3'}),
+                    html.Div(id="position-size-output", style={'fontSize': '0.95rem'}),
+                    html.Hr(style={'borderColor': '#495057', 'margin': '15px 0', 'opacity': '0.3'}),
+                    dbc.Button(
+                        [html.I(className="bi bi-journal-plus me-2"), "Add to Journal"],
+                        id="add-to-journal-btn",
+                        style={
+                            'background': 'linear-gradient(135deg, #4facfe 0%, #00f2fe 100%)',
+                            'border': 'none',
+                            'borderRadius': '8px',
+                            'padding': '0.625rem 1.25rem',
+                            'fontSize': '0.95rem',
+                            'fontWeight': '600',
+                            'textTransform': 'uppercase',
+                            'letterSpacing': '0.5px',
+                            'boxShadow': '0 4px 15px rgba(79, 172, 254, 0.4)',
+                            'transition': 'all 0.3s ease'
+                        },
+                        className="w-100", 
+                        size="md"
+                    )
+                ], style={'backgroundColor': '#2d2d2d', 'padding': '1.5rem'})
+            ], style={
+                'border': 'none',
+                'borderRadius': '12px',
+                'boxShadow': '0 8px 32px rgba(0, 0, 0, 0.4)',
+                'marginBottom': '20px',
+                'overflow': 'hidden'
+            })
         ], md=12, lg=5),
         dbc.Col([
             html.Div(id="signal-card", children=[
                 dbc.Card([
-                    dbc.CardHeader(html.H6("💡 Trading Signal", className="mb-0", style={'color': '#ffffff'}),
-                                 style={'backgroundColor': '#212529'}),
+                    dbc.CardHeader(
+                        html.H6("💡 Trading Signal", className="mb-0", 
+                               style={'color': '#ffffff', 'fontWeight': '600', 'letterSpacing': '0.5px'}),
+                        style={
+                            'background': 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)',
+                            'borderBottom': 'none',
+                            'padding': '0.75rem 1rem'
+                        }
+                    ),
                     dbc.CardBody([
-                        html.H5("Click Analyze to see signals", className="text-center", style={'color': '#adb5bd'})
-                    ], style={'backgroundColor': '#2d2d2d'})
-                ], style={'border': '1px solid #495057'})
+                        html.H5("Click Analyze", className="text-center", 
+                               style={'color': '#adb5bd', 'fontSize': '0.9rem', 'fontWeight': '500'})
+                    ], style={'backgroundColor': '#2d2d2d', 'padding': '1.5rem 1rem'})
+                ], style={
+                    'border': 'none',
+                    'borderRadius': '12px',
+                    'boxShadow': '0 8px 32px rgba(0, 0, 0, 0.4)',
+                    'overflow': 'hidden',
+                    'height': '100%'
+                })
             ])
-        ], md=12, lg=4)
+        ], md=6, lg=2),
+        dbc.Col([
+            html.Div(id="entry-point-card", children=[
+                dbc.Card([
+                    dbc.CardHeader(
+                        html.H6("🎯 Entry Point", className="mb-0", 
+                               style={'color': '#ffffff', 'fontWeight': '600', 'letterSpacing': '0.5px'}),
+                        style={
+                            'background': 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)',
+                            'borderBottom': 'none',
+                            'padding': '0.75rem 1rem'
+                        }
+                    ),
+                    dbc.CardBody([
+                        html.H5("Click Analyze", className="text-center", 
+                               style={'color': '#adb5bd', 'fontSize': '0.9rem', 'fontWeight': '500'})
+                    ], style={'backgroundColor': '#2d2d2d', 'padding': '1.5rem 1rem'})
+                ], style={
+                    'border': 'none',
+                    'borderRadius': '12px',
+                    'boxShadow': '0 8px 32px rgba(0, 0, 0, 0.4)',
+                    'overflow': 'hidden',
+                    'height': '100%'
+                })
+            ])
+        ], md=6, lg=2)
     ], className="mb-4"),
     dbc.Row([
         dbc.Col(dcc.Loading(children=[dcc.Graph(id="stock-chart")], type="default"), width=12)
     ]),
     dbc.Row([
         dbc.Col(html.Div(id="analysis-output", className="mt-3"), width=12)
+    ]),
+    
+    # Journal Entry Modal
+    dbc.Modal([
+        dbc.ModalHeader(dbc.ModalTitle("📔 Add Trade to Journal")),
+        dbc.ModalBody([
+            dbc.Row([
+                dbc.Col([
+                    dbc.Label("Date:", style={'fontWeight': 'bold', 'color': '#e0e0e0'}),
+                    dbc.Input(
+                        id="journal-date-input",
+                        type="date",
+                        value=datetime.now().strftime('%Y-%m-%d'),
+                        style={'backgroundColor': '#2d2d2d', 'color': '#ffffff'}
+                    )
+                ], md=6),
+                dbc.Col([
+                    dbc.Label("Action:", style={'fontWeight': 'bold', 'color': '#e0e0e0'}),
+                    dcc.Dropdown(
+                        id="journal-action-dropdown",
+                        options=[
+                            {'label': '📈 BUY', 'value': 'BUY'},
+                            {'label': '📉 SELL', 'value': 'SELL'}
+                        ],
+                        value='BUY',
+                        clearable=False
+                    )
+                ], md=6)
+            ], className="mb-3"),
+            dbc.Row([
+                dbc.Col([
+                    dbc.Label("Ticker:", style={'fontWeight': 'bold', 'color': '#e0e0e0'}),
+                    dbc.Input(
+                        id="journal-ticker-input",
+                        type="text",
+                        placeholder="Stock symbol",
+                        style={'backgroundColor': '#2d2d2d', 'color': '#ffffff'}
+                    )
+                ], md=6),
+                dbc.Col([
+                    dbc.Label("Position Size (shares):", style={'fontWeight': 'bold', 'color': '#e0e0e0'}),
+                    dbc.Input(
+                        id="journal-position-size-input",
+                        type="number",
+                        placeholder="Number of shares",
+                        style={'backgroundColor': '#2d2d2d', 'color': '#ffffff'}
+                    )
+                ], md=6)
+            ], className="mb-3"),
+            dbc.Row([
+                dbc.Col([
+                    dbc.Label("Entry Price ($):", style={'fontWeight': 'bold', 'color': '#e0e0e0'}),
+                    dbc.Input(
+                        id="journal-entry-price-input",
+                        type="number",
+                        placeholder="Entry price",
+                        style={'backgroundColor': '#2d2d2d', 'color': '#ffffff'}
+                    )
+                ], md=4),
+                dbc.Col([
+                    dbc.Label("Stop Loss ($):", style={'fontWeight': 'bold', 'color': '#e0e0e0'}),
+                    dbc.Input(
+                        id="journal-stop-loss-input",
+                        type="number",
+                        placeholder="Stop loss",
+                        style={'backgroundColor': '#2d2d2d', 'color': '#ffffff'}
+                    )
+                ], md=4),
+                dbc.Col([
+                    dbc.Label("Take Profit ($):", style={'fontWeight': 'bold', 'color': '#e0e0e0'}),
+                    dbc.Input(
+                        id="journal-take-profit-input",
+                        type="number",
+                        placeholder="Take profit",
+                        style={'backgroundColor': '#2d2d2d', 'color': '#ffffff'}
+                    )
+                ], md=4)
+            ], className="mb-3"),
+            dbc.Label("Notes:", style={'fontWeight': 'bold', 'color': '#e0e0e0'}),
+            dbc.Textarea(
+                id="journal-notes-input",
+                placeholder="Trade notes, setup, or reasons...",
+                style={'backgroundColor': '#2d2d2d', 'color': '#ffffff', 'minHeight': '100px'}
+            ),
+            html.Div(id="journal-add-feedback", className="mt-3")
+        ]),
+        dbc.ModalFooter([
+            dbc.Button("💾 Save to Journal", id="journal-save-btn", color="success", className="me-2"),
+            dbc.Button("Cancel", id="journal-cancel-btn", color="secondary")
+        ])
+    ], id="journal-modal", is_open=False, size="lg", style={'color': '#000000'}),
+    
+    dcc.Store(id="current-ticker-store"),
+    
+    # Footer
+    dbc.Row([
+        dbc.Col([
+            html.Hr(style={
+                'borderColor': '#495057', 
+                'margin': '40px 0 20px 0',
+                'opacity': '0.3'
+            }),
+            html.P([
+                "Made with ",
+                html.Span("❤️", style={'color': '#f5576c', 'fontSize': '1.1rem'}),
+                " by Aladdin"
+            ], 
+            className="text-center", 
+            style={
+                'fontSize': '0.9rem', 
+                'paddingBottom': '30px',
+                'color': '#9ca3af',
+                'fontWeight': '500',
+                'letterSpacing': '0.5px'
+            })
+        ], width=12)
     ])
 ], fluid=True)
 
@@ -319,6 +670,7 @@ layout = dbc.Container([
     [Output("stock-chart", "figure"),
      Output("analysis-output", "children"),
      Output("signal-card", "children"),
+     Output("entry-point-card", "children"),
      Output("entry-price", "value"),
      Output("stop-loss-price", "value")],
     Input("analyze-btn", "n_clicks"),
@@ -330,6 +682,8 @@ def update_chart(n_clicks, symbol, timeframe):
     if not n_clicks or not symbol:
         return go.Figure(), "", dbc.Card([
             dbc.CardBody(html.H5("Enter a symbol and click Analyze"))
+        ]), dbc.Card([
+            dbc.CardBody(html.H5("Enter a symbol and click Analyze"))
         ]), 0, 0
     
     interval = {'1d_intraday': '5m', '5d': '15m', '1mo': '1h', '3mo': '1d'}.get(timeframe, '1d')
@@ -337,6 +691,8 @@ def update_chart(n_clicks, symbol, timeframe):
     
     if error:
         return go.Figure(), dbc.Alert(error, color="danger"), dbc.Card([
+            dbc.CardBody(html.H5("Error loading data", className="text-danger"))
+        ]), dbc.Card([
             dbc.CardBody(html.H5("Error loading data", className="text-danger"))
         ]), 0, 0
     
@@ -529,27 +885,139 @@ def update_chart(n_clicks, symbol, timeframe):
     }
     
     signal_card = dbc.Card([
+        dbc.CardHeader(
+            html.H6("💡 Trading Signal", className="mb-0", 
+                   style={'color': '#ffffff', 'fontWeight': '600', 'letterSpacing': '0.5px'}),
+            style={
+                'background': 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)',
+                'borderBottom': 'none',
+                'padding': '0.75rem 1rem'
+            }
+        ),
         dbc.CardBody([
-            dbc.Row([
-                dbc.Col([
-                    html.H2([
-                        signal_icon_map.get(signal, ""), " ", signal
-                    ], className=f"text-{signal_color_map.get(signal, 'secondary')} mb-0"),
-                    html.P(f"Confidence: {confidence}%", className="text-muted mb-0")
-                ], width=4),
-                dbc.Col([
-                    html.Small("Stop Loss", className="d-block text-muted"),
-                    html.H5(f"${stop_loss:.2f}", className="text-danger mb-0"),
-                    html.Small(f"{((stop_loss-price)/price*100):.1f}%", className="text-muted")
-                ], width=4),
-                dbc.Col([
-                    html.Small("Take Profit", className="d-block text-muted"),
-                    html.H5(f"${take_profit:.2f}", className="text-success mb-0"),
-                    html.Small(f"+{((take_profit-price)/price*100):.1f}%", className="text-muted")
-                ], width=4)
+            html.H2([
+                signal_icon_map.get(signal, ""), " ", signal
+            ], className=f"text-{signal_color_map.get(signal, 'secondary')} mb-2 text-center",
+               style={'fontWeight': '700', 'letterSpacing': '1px'}),
+            html.P(f"Confidence: {confidence}%", className="text-muted mb-0 text-center",
+                  style={'fontSize': '0.9rem', 'fontWeight': '500'})
+        ], style={'backgroundColor': '#2d2d2d', 'padding': '1.5rem 1rem'})
+    ], style={
+        'border': 'none',
+        'borderRadius': '12px',
+        'boxShadow': '0 8px 32px rgba(0, 0, 0, 0.4)',
+        'overflow': 'hidden'
+    }, className="mb-3")
+    
+    # Calculate suggested entry point based on technical analysis
+    rsi_value = df['RSI'].iloc[-1] if 'RSI' in df.columns and not df['RSI'].isna().iloc[-1] else None
+    suggested_entry, entry_reason = calculate_suggested_entry(price, signal, supports, resistances, rsi_value)
+    
+    # Determine if this is a BUY or SELL action
+    action_type = "BUY" if signal in ["BUY", "STRONG BUY"] else "SELL" if signal in ["SELL", "STRONG SELL"] else "HOLD"
+    action_color = "success" if action_type == "BUY" else "danger" if action_type == "SELL" else "warning"
+    action_icon = "📈" if action_type == "BUY" else "📉" if action_type == "SELL" else "⏸️"
+    
+    # Build entry point card content based on signal type
+    if action_type == "SELL":
+        # For SELL signals (exits), show only exit price and downside target
+        entry_card_body = [
+            # Suggested Entry (inline format)
+            html.Div([
+                html.P([
+                    html.Strong("Suggested Exit:", style={'color': '#adb5bd', 'fontSize': '0.85rem'}),
+                    html.Br(),
+                    html.Span(entry_reason, 
+                             className=f"text-{action_color}",
+                             style={'fontSize': '0.95rem', 'fontWeight': '600'})
+                ], className="mb-3 text-center", style={'lineHeight': '1.6'})
+            ]),
+            
+            html.Hr(style={'borderColor': '#495057', 'margin': '10px 0'}),
+            
+            # Current Price for reference
+            html.Div([
+                html.Small("Exit Price", className="d-block text-muted text-center", 
+                         style={'fontWeight': '600', 'fontSize': '0.7rem'}),
+                html.P(f"${price:.2f}", className="text-info mb-3 text-center", 
+                       style={'fontWeight': 'bold', 'fontSize': '1.1rem'})
+            ]),
+            
+            # Downside Target (instead of take profit for sells)
+            html.Div([
+                html.Small("Downside Target", className="d-block text-muted text-center",
+                         style={'fontWeight': '600', 'fontSize': '0.7rem'}),
+                html.P(f"${take_profit:.2f}", className="text-warning mb-1 text-center",
+                       style={'fontWeight': 'bold', 'fontSize': '0.95rem'}),
+                html.Small(f"{((take_profit-price)/price*100):.1f}%", 
+                         className="text-warning d-block text-center")
             ])
-        ])
-    ], color=signal_color_map.get(signal, "secondary"), outline=True, className="mb-3")
+        ]
+    else:
+        # For BUY/HOLD signals, show full entry setup
+        entry_card_body = [
+            # Suggested Entry (inline format)
+            html.Div([
+                html.P([
+                    html.Strong("Suggested Entry:", style={'color': '#adb5bd', 'fontSize': '0.85rem'}),
+                    html.Br(),
+                    html.Span(entry_reason, 
+                             className=f"text-{action_color}",
+                             style={'fontSize': '0.95rem', 'fontWeight': '600'})
+                ], className="mb-3 text-center", style={'lineHeight': '1.6'})
+            ]),
+            
+            html.Hr(style={'borderColor': '#495057', 'margin': '10px 0'}),
+            
+            # Current Price for reference
+            html.Div([
+                html.Small("Current Price", className="d-block text-muted text-center", 
+                         style={'fontWeight': '600', 'fontSize': '0.7rem'}),
+                html.P(f"${price:.2f}", className="text-info mb-2 text-center", 
+                       style={'fontWeight': 'bold', 'fontSize': '1.1rem'})
+            ]),
+            
+            # Stop Loss
+            html.Div([
+                html.Small("Stop Loss", className="d-block text-muted text-center",
+                         style={'fontWeight': '600', 'fontSize': '0.7rem'}),
+                html.P(f"${stop_loss:.2f}", className="text-danger mb-1 text-center",
+                       style={'fontWeight': 'bold', 'fontSize': '0.95rem'}),
+                html.Small(f"{((stop_loss-price)/price*100):.1f}%", 
+                         className="text-muted d-block text-center mb-2")
+            ]),
+            
+            # Take Profit
+            html.Div([
+                html.Small("Take Profit", className="d-block text-muted text-center",
+                         style={'fontWeight': '600', 'fontSize': '0.7rem'}),
+                html.P(f"${take_profit:.2f}", className="text-success mb-1 text-center",
+                       style={'fontWeight': 'bold', 'fontSize': '0.95rem'}),
+                html.Small(f"+{((take_profit-price)/price*100):.1f}%", 
+                         className="text-success d-block text-center")
+            ])
+        ]
+    
+    # Set card header based on signal type
+    card_title = "🎯 Recommended Exit" if action_type == "SELL" else "🎯 Recommended Entry"
+    
+    entry_point_card = dbc.Card([
+        dbc.CardHeader(
+            html.H6(card_title, className="mb-0", 
+                   style={'color': '#ffffff', 'fontWeight': '600', 'letterSpacing': '0.5px'}),
+            style={
+                'background': 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)',
+                'borderBottom': 'none',
+                'padding': '0.75rem 1rem'
+            }
+        ),
+        dbc.CardBody(entry_card_body, style={'backgroundColor': '#2d2d2d', 'padding': '1.5rem 1rem'})
+    ], style={
+        'border': 'none',
+        'borderRadius': '12px',
+        'boxShadow': '0 8px 32px rgba(0, 0, 0, 0.4)',
+        'overflow': 'hidden'
+    })
     
     # === ANALYSIS DASHBOARD ===
     color_class = "success" if change >= 0 else "danger"
@@ -562,8 +1030,12 @@ def update_chart(n_clicks, symbol, timeframe):
     analysis = dbc.Card([
         dbc.CardHeader(
             html.H5("📊 Technical Analysis Dashboard", className="mb-0",
-                   style={'color': '#ffffff', 'fontWeight': 'bold'}),
-            style={'backgroundColor': '#212529'}
+                   style={'color': '#ffffff', 'fontWeight': '600', 'letterSpacing': '0.5px'}),
+            style={
+                'background': 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)',
+                'borderBottom': 'none',
+                'padding': '1rem 1.25rem'
+            }
         ),
         dbc.CardBody([
             # Top metrics row
@@ -646,14 +1118,19 @@ def update_chart(n_clicks, symbol, timeframe):
                     ]) if (reasons.get('buy') or reasons.get('sell')) else html.P("No strong signals detected", className="text-muted")
                 ], width=12)
             ])
-        ], style={'backgroundColor': '#2d2d2d'})
-    ], className="mt-3", style={'border': '1px solid #495057'})
+        ], style={'backgroundColor': '#2d2d2d', 'padding': '1.5rem'})
+    ], className="mt-3", style={
+        'border': 'none',
+        'borderRadius': '12px',
+        'boxShadow': '0 8px 32px rgba(0, 0, 0, 0.4)',
+        'overflow': 'hidden'
+    })
     
     # Return current price as entry and calculated stop loss
     entry = round(price, 2) if price else 0
     stop = round(stop_loss, 2) if stop_loss else 0
     
-    return fig, analysis, signal_card, entry, stop
+    return fig, analysis, signal_card, entry_point_card, entry, stop
 
 
 @callback(
@@ -666,9 +1143,24 @@ def update_chart(n_clicks, symbol, timeframe):
 def calculate_position_size(account_size, risk_percent, entry_price, stop_loss):
     """Calculate position size based on risk management parameters"""
     
-    if not all([account_size, risk_percent, entry_price, stop_loss]) or entry_price <= 0 or stop_loss <= 0:
+    # Check if any value is None (not entered)
+    if account_size is None or risk_percent is None or entry_price is None or stop_loss is None:
         return html.Div([
             html.P("⚠️ Enter all values to calculate position size", 
+                   style={'color': '#FFA726', 'textAlign': 'center', 'marginBottom': '0'})
+        ])
+    
+    # Validate positive values for entry and stop loss
+    if entry_price <= 0 or stop_loss <= 0:
+        return html.Div([
+            html.P("⚠️ Entry price and stop loss must be greater than 0", 
+                   style={'color': '#FFA726', 'textAlign': 'center', 'marginBottom': '0'})
+        ])
+    
+    # Validate account size and risk percent
+    if account_size <= 0 or risk_percent <= 0:
+        return html.Div([
+            html.P("⚠️ Account size and risk percent must be greater than 0", 
                    style={'color': '#FFA726', 'textAlign': 'center', 'marginBottom': '0'})
         ])
     
@@ -685,11 +1177,23 @@ def calculate_position_size(account_size, risk_percent, entry_price, stop_loss):
     # Calculate risk per share
     risk_per_share = entry_price - stop_loss
     
-    # Calculate number of shares
-    shares = int(risk_amount / risk_per_share)
+    # Calculate number of shares based on risk
+    shares_by_risk = int(risk_amount / risk_per_share)
+    
+    # Calculate max shares the account can afford
+    max_affordable_shares = int(account_size / entry_price)
+    
+    # Use the lower of the two to ensure position doesn't exceed account size
+    shares = min(shares_by_risk, max_affordable_shares)
+    
+    # Flag if position was limited by account size
+    limited_by_account = shares_by_risk > max_affordable_shares
     
     # Calculate position value
     position_value = shares * entry_price
+    
+    # Calculate actual risk with adjusted shares
+    actual_risk = shares * risk_per_share
     
     # Calculate position as percentage of account
     position_percent = (position_value / account_size) * 100
@@ -713,8 +1217,8 @@ def calculate_position_size(account_size, risk_percent, entry_price, stop_loss):
             ], width=4),
             dbc.Col([
                 html.Div([
-                    html.Small("RISK AMOUNT", style={'color': '#adb5bd', 'fontSize': '0.75rem'}),
-                    html.H4(f"${risk_amount:,.2f}", style={'color': '#FFA726', 'fontWeight': 'bold', 'marginBottom': '0'})
+                    html.Small("ACTUAL RISK", style={'color': '#adb5bd', 'fontSize': '0.75rem'}),
+                    html.H4(f"${actual_risk:,.2f}", style={'color': '#FFA726', 'fontWeight': 'bold', 'marginBottom': '0'})
                 ], style={'textAlign': 'center'})
             ], width=4),
         ]),
@@ -730,7 +1234,100 @@ def calculate_position_size(account_size, risk_percent, entry_price, stop_loss):
             ], width=6),
         ]),
         html.Div([
+            html.Small(f"ℹ️ Position limited by account size (max {max_affordable_shares} shares affordable)", 
+                      style={'color': '#64b5f6', 'fontSize': '0.85rem', 'fontWeight': 'bold'})
+        ], style={'textAlign': 'center', 'marginTop': '5px'}) if limited_by_account else html.Div(),
+        html.Div([
             html.Small("⚠️ Warning: Position exceeds 25% of account", 
                       style={'color': '#ef5350', 'fontSize': '0.85rem', 'fontWeight': 'bold'})
         ], style={'textAlign': 'center', 'marginTop': '5px'}) if position_percent > 25 else html.Div()
     ])
+
+# Journal Callbacks
+@callback(
+    [Output("journal-modal", "is_open"),
+     Output("journal-ticker-input", "value"),
+     Output("journal-entry-price-input", "value"),
+     Output("journal-stop-loss-input", "value"),
+     Output("journal-take-profit-input", "value")],
+    [Input("add-to-journal-btn", "n_clicks"),
+     Input("journal-save-btn", "n_clicks"),
+     Input("journal-cancel-btn", "n_clicks")],
+    [State("journal-modal", "is_open"),
+     State("stock-input", "value"),
+     State("entry-price", "value"),
+     State("stop-loss-price", "value"),
+     State("signal-card", "children")],
+    prevent_initial_call=True
+)
+def toggle_journal_modal(add_click, save_click, cancel_click, is_open, ticker, entry, stop, signal_card):
+    """Toggle journal modal and pre-fill values from position calculator."""
+    if add_click:
+        # Try to extract take profit from signal card
+        take_profit_value = None
+        if signal_card and isinstance(signal_card, dict):
+            try:
+                # Extract take profit from the signal card structure
+                card_body = signal_card.get('props', {}).get('children', [])
+                if isinstance(card_body, list):
+                    for item in card_body:
+                        if isinstance(item, dict):
+                            props = item.get('props', {})
+                            children = props.get('children', [])
+                            if isinstance(children, list):
+                                for child in children:
+                                    if isinstance(child, dict) and 'Take Profit' in str(child):
+                                        # Found take profit, extract value
+                                        text = str(child.get('props', {}).get('children', ''))
+                                        if '$' in text:
+                                            try:
+                                                take_profit_value = float(text.split('$')[1].split()[0])
+                                            except:
+                                                pass
+            except:
+                pass
+        return True, ticker or "", entry or None, stop or None, take_profit_value
+    elif save_click or cancel_click:
+        return False, no_update, no_update, no_update, no_update
+    return is_open, no_update, no_update, no_update, no_update
+
+@callback(
+    [Output("journal-add-feedback", "children"),
+     Output("journal-modal", "is_open", allow_duplicate=True)],
+    Input("journal-save-btn", "n_clicks"),
+    [State("journal-date-input", "value"),
+     State("journal-ticker-input", "value"),
+     State("journal-action-dropdown", "value"),
+     State("journal-entry-price-input", "value"),
+     State("journal-stop-loss-input", "value"),
+     State("journal-take-profit-input", "value"),
+     State("journal-position-size-input", "value"),
+     State("journal-notes-input", "value")],
+    prevent_initial_call=True
+)
+def save_journal_entry(n_clicks, date, ticker, action, entry_price, stop_loss, 
+                       take_profit, position_size, notes):
+    """Save journal entry to database."""
+    if not n_clicks:
+        return no_update, no_update
+    
+    # Validate required fields
+    if not ticker:
+        return dbc.Alert("⚠️ Please enter a ticker symbol", color="warning"), True
+    
+    # Add entry to database
+    success, message = add_journal_entry(
+        date=date or datetime.now().strftime('%Y-%m-%d'),
+        ticker=ticker,
+        action=action,
+        entry_price=entry_price,
+        stop_loss=stop_loss,
+        take_profit=take_profit,
+        position_size=position_size,
+        notes=notes or ""
+    )
+    
+    if success:
+        return dbc.Alert("✅ " + message, color="success"), False
+    else:
+        return dbc.Alert("❌ " + message, color="danger"), True

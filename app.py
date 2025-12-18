@@ -10,8 +10,9 @@ navbar = dbc.NavbarSimple(
     children=[
         dbc.NavItem(dbc.NavLink("Dashboard", href="/", style={'fontSize': '1.1rem'})),
         dbc.NavItem(dbc.NavLink("Watchlist", href="/watchlist", style={'fontSize': '1.1rem'})),
+        dbc.NavItem(dbc.NavLink("Journal", href="/journal", style={'fontSize': '1.1rem'})),
     ],
-    brand="📊 Swing Trading Dashboard",
+    brand="📊 Gemini Trading Dashboard",
     brand_href="/",
     color="dark",
     dark=True,

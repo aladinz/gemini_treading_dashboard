@@ -13,3 +13,41 @@
 .rating-na {
     color: #777;
 }
+
+/* Dark theme dropdown styling */
+.dark-dropdown .Select-control {
+    background-color: #2d2d2d !important;
+    border-color: #495057 !important;
+}
+
+.dark-dropdown .Select-menu-outer {
+    background-color: #2d2d2d !important;
+    border-color: #495057 !important;
+}
+
+.dark-dropdown .Select-option {
+    background-color: #2d2d2d !important;
+    color: #ffffff !important;
+}
+
+.dark-dropdown .Select-option.is-focused {
+    background-color: #3d3d3d !important;
+    color: #ffffff !important;
+}
+
+.dark-dropdown .Select-option.is-selected {
+    background-color: #495057 !important;
+    color: #ffffff !important;
+}
+
+.dark-dropdown .Select-value-label {
+    color: #ffffff !important;
+}
+
+.dark-dropdown .Select-placeholder {
+    color: #aaaaaa !important;
+}
+
+.dark-dropdown .Select-input > input {
+    color: #ffffff !important;
+}
