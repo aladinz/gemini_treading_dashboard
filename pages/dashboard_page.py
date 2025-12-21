@@ -8,6 +8,7 @@ import pandas as pd
 import numpy as np
 from datetime import datetime
 from utils import add_journal_entry
+from ai_helper import generate_trading_insights
 
 dash.register_page(__name__, path='/', name='Dashboard')
 
@@ -545,6 +546,63 @@ layout = dbc.Container([
     dbc.Row([
         dbc.Col(dcc.Loading(children=[dcc.Graph(id="stock-chart")], type="default"), width=12)
     ]),
+    
+    # AI Insights Section
+    dbc.Row([
+        dbc.Col([
+            html.Div(id="ai-insights-container", children=[
+                dbc.Card([
+                    dbc.CardHeader([
+                        dbc.Row([
+                            dbc.Col(
+                                html.H6("🤖 AI Trading Insights", className="mb-0", 
+                                       style={'color': '#ffffff', 'fontWeight': '600', 'letterSpacing': '0.5px'}),
+                                width="auto"
+                            ),
+                            dbc.Col(
+                                dbc.Button(
+                                    "Generate Insights",
+                                    id="generate-ai-insights-btn",
+                                    size="sm",
+                                    style={
+                                        'background': 'linear-gradient(135deg, #fa709a 0%, #fee140 100%)',
+                                        'border': 'none',
+                                        'borderRadius': '6px',
+                                        'padding': '0.4rem 1rem',
+                                        'fontSize': '0.85rem',
+                                        'fontWeight': '600',
+                                        'boxShadow': '0 2px 8px rgba(250, 112, 154, 0.3)'
+                                    }
+                                ),
+                                className="text-end"
+                            )
+                        ], align="center", justify="between")
+                    ], style={
+                        'background': 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)',
+                        'borderBottom': 'none',
+                        'padding': '1rem 1.25rem'
+                    }),
+                    dbc.CardBody([
+                        dcc.Loading(
+                            html.Div(id="ai-insights-output", children=[
+                                html.P("Click 'Generate Insights' after analyzing a stock to get AI-powered trading advice, risk assessment, and educational tips.", 
+                                      className="text-center text-muted", 
+                                      style={'padding': '2rem', 'fontSize': '0.95rem'})
+                            ]),
+                            type="circle"
+                        )
+                    ], style={'backgroundColor': '#2d2d2d', 'padding': '1.5rem'})
+                ], style={
+                    'border': 'none',
+                    'borderRadius': '12px',
+                    'boxShadow': '0 8px 32px rgba(0, 0, 0, 0.4)',
+                    'marginBottom': '20px',
+                    'overflow': 'hidden'
+                })
+            ])
+        ], width=12)
+    ]),
+    
     dbc.Row([
         dbc.Col(html.Div(id="analysis-output", className="mt-3"), width=12)
     ]),
@@ -640,6 +698,7 @@ layout = dbc.Container([
     ], id="journal-modal", is_open=False, size="lg", style={'color': '#000000'}),
     
     dcc.Store(id="current-ticker-store"),
+    dcc.Store(id="analysis-data-store"),  # Store for AI insights data
     
     # Footer
     dbc.Row([
@@ -672,7 +731,8 @@ layout = dbc.Container([
      Output("signal-card", "children"),
      Output("entry-point-card", "children"),
      Output("entry-price", "value"),
-     Output("stop-loss-price", "value")],
+     Output("stop-loss-price", "value"),
+     Output("analysis-data-store", "data")],
     Input("analyze-btn", "n_clicks"),
     [State("stock-input", "value"),
      State("timeframe-dropdown", "value")],
@@ -684,7 +744,7 @@ def update_chart(n_clicks, symbol, timeframe):
             dbc.CardBody(html.H5("Enter a symbol and click Analyze"))
         ]), dbc.Card([
             dbc.CardBody(html.H5("Enter a symbol and click Analyze"))
-        ]), 0, 0
+        ]), 0, 0, None
     
     interval = {'1d_intraday': '5m', '5d': '15m', '1mo': '1h', '3mo': '1d'}.get(timeframe, '1d')
     df, company_name, error = fetch_stock_data(symbol, timeframe, interval)
@@ -1130,7 +1190,104 @@ def update_chart(n_clicks, symbol, timeframe):
     entry = round(price, 2) if price else 0
     stop = round(stop_loss, 2) if stop_loss else 0
     
-    return fig, analysis, signal_card, entry_point_card, entry, stop
+    # Prepare data for AI insights
+    analysis_data = {
+        'ticker': symbol.upper(),
+        'price': float(price),
+        'signal': signal,
+        'confidence': confidence,
+        'rsi': float(rsi) if rsi and not pd.isna(rsi) else None,
+        'macd': float(df['MACD'].iloc[-1]) if 'MACD' in df.columns and not pd.isna(df['MACD'].iloc[-1]) else None,
+        'macd_signal': float(df['MACD_Signal'].iloc[-1]) if 'MACD_Signal' in df.columns and not pd.isna(df['MACD_Signal'].iloc[-1]) else None,
+        'sma20': float(df['SMA20'].iloc[-1]) if 'SMA20' in df.columns and not pd.isna(df['SMA20'].iloc[-1]) else None,
+        'sma50': float(df['SMA50'].iloc[-1]) if 'SMA50' in df.columns and not pd.isna(df['SMA50'].iloc[-1]) else None,
+        'sma200': float(df['SMA200'].iloc[-1]) if 'SMA200' in df.columns and not pd.isna(df['SMA200'].iloc[-1]) else None,
+        'support_levels': [float(s) for s in supports] if supports else [],
+        'resistance_levels': [float(r) for r in resistances] if resistances else [],
+        'entry_price': float(entry),
+        'stop_loss': float(stop),
+        'take_profit': float(take_profit) if take_profit else None
+    }
+    
+    return fig, analysis, signal_card, entry_point_card, entry, stop, analysis_data
+
+
+@callback(
+    Output("ai-insights-output", "children"),
+    Input("generate-ai-insights-btn", "n_clicks"),
+    State("analysis-data-store", "data"),
+    prevent_initial_call=True
+)
+def generate_ai_insights_callback(n_clicks, analysis_data):
+    """Generate AI-powered trading insights"""
+    if not n_clicks or not analysis_data:
+        return html.P("Please analyze a stock first before generating insights.", 
+                     className="text-warning text-center", style={'padding': '2rem'})
+    
+    try:
+        # Generate insights using OpenAI
+        insights_text = generate_trading_insights(
+            ticker=analysis_data['ticker'],
+            price=analysis_data['price'],
+            signal=analysis_data['signal'],
+            confidence=analysis_data['confidence'],
+            technical_data=analysis_data
+        )
+        
+        # Parse and format the insights
+        sections = insights_text.split('\n\n')
+        formatted_sections = []
+        
+        for section in sections:
+            if section.strip():
+                # Check if section has a header (contains **)
+                if '**' in section:
+                    parts = section.split('**')
+                    if len(parts) >= 3:
+                        header = parts[1]
+                        content = parts[2].strip()
+                        
+                        # Determine icon and color based on header
+                        if 'Signal' in header or 'Analysis' in header:
+                            icon = '📊'
+                            color = '#4facfe'
+                        elif 'Key Factors' in header or 'Factors' in header:
+                            icon = '🔑'
+                            color = '#fa709a'
+                        elif 'Risk' in header:
+                            icon = '⚠️'
+                            color = '#ffc107'
+                        elif 'Action' in header:
+                            icon = '🎯'
+                            color = '#26a69a'
+                        elif 'Learning' in header or 'Tip' in header:
+                            icon = '💡'
+                            color = '#667eea'
+                        else:
+                            icon = '📝'
+                            color = '#ffffff'
+                        
+                        formatted_sections.append(
+                            html.Div([
+                                html.H6([
+                                    html.Span(icon, style={'marginRight': '8px'}),
+                                    header
+                                ], style={'color': color, 'fontWeight': '600', 'marginBottom': '8px'}),
+                                dcc.Markdown(content, style={'color': '#e0e0e0', 'lineHeight': '1.6'})
+                            ], style={'marginBottom': '20px'})
+                        )
+                else:
+                    formatted_sections.append(
+                        html.P(section, style={'color': '#e0e0e0', 'lineHeight': '1.6', 'marginBottom': '15px'})
+                    )
+        
+        return html.Div(formatted_sections)
+        
+    except Exception as e:
+        return dbc.Alert([
+            html.H6("⚠️ Error Generating Insights", className="mb-2"),
+            html.P(f"Unable to generate AI insights: {str(e)}", className="mb-0 small")
+        ], color="warning")
 
 
 @callback(
